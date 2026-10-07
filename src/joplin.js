@@ -1,58 +1,79 @@
-// Client for the Joplin Web Clipper API (the local REST API Joplin desktop
-// exposes while it is running). Zero dependencies: uses global fetch.
-//
-// Auth: every request carries the API token as a `?token=` query parameter.
-// The token is read from JOPLIN_TOKEN, falling back to
-// ~/.config/joplin-desktop/settings.json (key "api.token"). The port comes
-// from JOPLIN_PORT, then "api.port" in that file, then the default 41184.
+// Thin wrapper over the Joplin Web Clipper API.
+// Base URL is loopback-only. Credentials are resolved lazily on the first API
+// call (never at import time, so the MCP handshake works even before auth is
+// configured), from JOPLIN_TOKEN / JOPLIN_PORT or from a Joplin settings.json —
+// desktop profile (~/.config/joplin-desktop) or CLI profile (~/.config/joplin).
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-function loadAuth() {
-	let token = process.env.JOPLIN_TOKEN || '';
-	let port = Number(process.env.JOPLIN_PORT || 0);
-	if (!token || !port) {
-		const settingsPath = join(homedir(), '.config', 'joplin-desktop', 'settings.json');
-		try {
-			const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
-			token = token || settings['api.token'];
-			port = port || Number(settings['api.port'] || 41184);
-		} catch (error) {
-			throw new Error(
-				`joplin-mcp: cannot read token/port from ${settingsPath} (${error.message}). ` +
-				'Set JOPLIN_TOKEN and JOPLIN_PORT instead, or enable the Web Clipper API in Joplin.',
-			);
-		}
-	}
-	return { token, port };
+let cachedAuth = null;
+
+function settingsCandidates() {
+	return [
+		join(homedir(), '.config', 'joplin-desktop', 'settings.json'),
+		join(homedir(), '.config', 'joplin', 'settings.json'),
+	];
 }
 
-const { token, port } = loadAuth();
-const BASE = `http://localhost:${port}`;
-
-export async function api(method, path, { body, params } = {}) {
-	const url = new URL(BASE + path); // BASE is a fixed localhost URL built from a validated port
-	url.searchParams.set('token', token);
-	for (const [key, value] of Object.entries(params || {})) {
-		if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+function loadAuth() {
+	if (process.env.JOPLIN_TOKEN) {
+		return { token: process.env.JOPLIN_TOKEN, port: Number(process.env.JOPLIN_PORT || 41184) };
 	}
-	const res = await fetch(url, {
-		method,
-		headers: body ? { 'Content-Type': 'application/json' } : undefined,
-		body: body ? JSON.stringify(body) : undefined,
-	});
+	for (const path of settingsCandidates()) {
+		try {
+			const settings = JSON.parse(readFileSync(path, 'utf8'));
+			if (settings['api.token']) {
+				return { token: settings['api.token'], port: Number(settings['api.port'] || 41184) };
+			}
+		} catch {
+			// Missing or unreadable profile — try the next candidate.
+		}
+	}
+	throw new Error(
+		'joplin-mcp: no Web Clipper credentials found. Set JOPLIN_TOKEN (and optionally ' +
+		'JOPLIN_PORT), or enable the Web Clipper API in Joplin. Checked: ' +
+		settingsCandidates().join(', '),
+	);
+}
+
+function auth() {
+	if (!cachedAuth) cachedAuth = loadAuth();
+	return cachedAuth;
+}
+
+export async function api(method, path, body = null, params = {}) {
+	const { token, port } = auth();
+	const query = new URLSearchParams({ token, ...params });
+	let url;
+	try {
+		url = new URL(`http://localhost:${port}${path}`);
+	} catch (cause) {
+		throw new Error(`joplin-mcp: could not build request URL for ${path}: ${cause?.message ?? cause}`);
+	}
+	url.search = query.toString();
+	let res;
+	try {
+		res = await fetch(url, {
+			method,
+			headers: body ? { 'Content-Type': 'application/json' } : undefined,
+			body: body ? JSON.stringify(body) : undefined,
+		});
+	} catch (cause) {
+		throw new Error(
+			`Joplin Web Clipper API not reachable on localhost:${port} — is Joplin running ` +
+			`(desktop app, or \`joplin server start\` for the CLI)? Cause: ${cause?.message ?? cause}`,
+		);
+	}
 	if (!res.ok) {
-		const text = await res.text().catch(() => '');
-		throw new Error(`Joplin API ${method} ${path} failed: ${res.status} ${text}`.trim());
+		throw new Error(`Joplin API ${method} ${path} failed: ${res.status} ${await res.text()}`);
 	}
 	const text = await res.text();
-	if (!text) return {};
 	try {
-		return JSON.parse(text);
+		return text ? JSON.parse(text) : {};
 	} catch {
-		throw new Error(`Joplin API ${method} ${path} returned invalid JSON: ${text.slice(0, 200)}`);
+		throw new Error(`Joplin API ${method} ${path} returned invalid JSON (${text.length} chars)`);
 	}
 }
 
@@ -60,10 +81,10 @@ export async function apiPaged(path, params = {}) {
 	const items = [];
 	let page = 1;
 	for (;;) {
-		const res = await api('GET', path, { params: { ...params, page, limit: 100 } });
+		const res = await api('GET', path, null, { ...params, page, limit: 100 });
 		items.push(...(res.items || []));
 		if (!res.has_more) return items;
-		page += 1;
+		page++;
 	}
 }
 
@@ -76,13 +97,11 @@ export function listFolders() {
 }
 
 export function listNotesInFolder(folderId) {
-	return apiPaged(`/folders/${folderId}/notes`, {
-		fields: 'id,title,is_todo,todo_due,todo_completed,updated_time',
-	});
+	return apiPaged(`/folders/${folderId}/notes`, { fields: 'id,title,parent_id,updated_time' });
 }
 
-export function getNote(id, fields = 'id,title,body,parent_id,is_todo,todo_due,todo_completed,updated_time') {
-	return api('GET', `/notes/${id}`, { params: { fields } });
+export function getNote(id) {
+	return api('GET', `/notes/${id}`, null, { fields: 'id,title,body,parent_id,updated_time' });
 }
 
 export function searchNotes(query) {
@@ -90,17 +109,17 @@ export function searchNotes(query) {
 }
 
 export function createFolder(title, parentId = '') {
-	return api('POST', '/folders', { body: { title, parent_id: parentId } });
+	return api('POST', '/folders', { title, parent_id: parentId });
 }
 
-export function createNote(note) {
-	return api('POST', '/notes', { body: note });
+export function createNote(fields) {
+	return api('POST', '/notes', fields);
 }
 
 export function updateNote(id, patch) {
-	return api('PUT', `/notes/${id}`, { body: patch });
+	return api('PUT', `/notes/${id}`, patch);
 }
 
 export function deleteNote(id, permanent = false) {
-	return api('DELETE', `/notes/${id}`, { params: { permanent: permanent ? 1 : 0 } });
+	return api('DELETE', `/notes/${id}`, null, { permanent: permanent ? 1 : 0 });
 }
